@@ -1,7 +1,7 @@
 # This script compiles all major work done for Stehn et al. 2026
 # For further questions, comments, or critiques please email stehn007@umn.edu
 # Christopher Stehn
-# August 18, 2025
+# November 21, 2025
 
 wd <- '~/Desktop/Larg Lab/MPNST Surfaceome/GITHUB UPLOAD/' # CHANGE FOR INDIVIDUAL USER
 setwd(wd)
@@ -9,6 +9,7 @@ setwd(wd)
 source('./surfaceomeFUNC.R')
 library(tidyverse)
 library(ComplexHeatmap)
+library(RColorBrewer)
 library(org.Hs.eg.db)
 library(ggrepel)
 library(clusterProfiler)
@@ -16,6 +17,7 @@ library(VennDiagram)
 library(matrixStats)
 library(limma)
 library(ggrepel)
+library(svglite)
 select <- dplyr::select # saves time by defining conflicted functions ahead of time
 filter <- dplyr::filter
 mutate <- dplyr::mutate
@@ -26,11 +28,14 @@ mutate <- dplyr::mutate
 MPNSTCLfile <- './larga002_wangx933_19253_20230726_EwIM_hcdIT_MUltiConsensus_wQuant_Proteins.txt'
 WUpdxFile <- './larga002_wangx933_19513_20240221_EwIM_hcdIT_MultiConsensus_wQuant_Proteins.txt'
 MNpdxFile <- './larga002_wangx933_19494_20240212_EnF_hcdIT_MultiConsensus_wQuant_Proteins.txt'
+MPNSThumanRNA <- './abundances.tsv'
+MPNSThumanSamples <- './humanRNAsamples.txt'
 ic50dbFile <- './MPNST_IC50db.xlsx'
 QuantibriteFile <- './PE_stats_Quantibrite_20-May-2025.txt'
 allLinesPEFile <- './PE_stats_20-May-2025.txt'
 CSPA <- './CSPA_human.xlsx'
-MPNST.RNA <- './tpmEngineeredMat.txt'
+hallmarkGMT <- './h.all.v2024.1.Hs.symbols.gmt.txt'
+MPNSTCL.RNA <- './tpmEngineeredMat.txt'
 S462TY.pairwiseCor <- './S462TY-SUZ12_pairwiseCor.txt'
 # plot names
 # plots were created as SVGs for easy editing
@@ -46,7 +51,10 @@ PDXspecFltHeatmapPlot <- './PDXspecFltHeatmap.png'
 PreFltTop50HeatmapPlot <- './FigS1.svg'
 ic50Plot <- './Fig5B.svg'
 ic50.v.QuantPlot <- './Fig5C.svg'
-QuantBeadValidPlot <- './FigS3.svg'
+QuantBeadValidPlot <- './FigS6.svg'
+crisprFltListPlot <- './FigS4.svg'
+HumanRNAFltHeatmap <- './FigS3.svg'
+PTK7boxplotRNA <- './FigS5.svg'
 
 
 
@@ -177,6 +185,131 @@ PDXenrich %>%
 
 totFlt1 <- inner_join(MPNSTflt1, PDXflt1, by = 'Gene Symbol') %>%
   select(-c('foundIn.x', 'foundIn.y', 'meanInt.x', 'meanInt.y'))
+totFlt1LIST <- totFlt1$`Gene Symbol`[!duplicated(totFlt1$`Gene Symbol`)]
+totFlt1uniprot <- MPNST %>% 
+  filter(`Gene Symbol` %in% totFlt1LIST & !duplicated(`Gene Symbol`)) %>%
+  pull(Accession)
+
+# compare RNA expression 
+# read in values from NF, aNF, MPNST, and tibial nerve samples
+humanRNA <- read.table(MPNSThumanRNA, header = TRUE) %>%
+  rownames_to_column(var = 'id')
+humanSamples <- read.table(MPNSThumanSamples, header = TRUE, sep = '\t')
+# R automatically appends 'X' to column names that start with numbers
+# to match colnames, make another column with prepended X for humanSamples
+# however, be sure to capture only strings starting with numbers to not perturb SRR samples
+humanSamples$newName <- gsub('^([0-9]+.*)', 'X\\1', humanSamples$sampleID)
+# map gene ensembl IDs to gene names
+geneMap <- AnnotationDbi::select(org.Hs.eg.db,
+                                 keys = humanRNA$id,
+                                 columns = 'SYMBOL',
+                                 keytype = 'ENSEMBL',
+                                 multiVals = 'first')
+humanRNA %>%
+  left_join(geneMap, by = c('id' = 'ENSEMBL')) %>%
+  filter(SYMBOL %in% totFlt1LIST) -> humanRNA
+# cast to longer data and merge with samples list
+# resulting object is useful for individual genes but not for larger heatmap
+humanRNA %>%
+  select(60, 2:59) %>%
+  pivot_longer(cols = -1, names_to = 'sample', values_to = 'TPM') %>%
+  left_join(select(humanSamples, newName, sampleType), by = c('sample' = 'newName')) %>%
+  filter(sampleType %in% c('MPNST', 'Neurofibroma', 'Atypical_NF', 'peripheral_nerve')) -> humanRNAlong
+# finally, relevel by disease stage
+humanRNAlong$sampleType <- factor(humanRNAlong$sampleType, 
+                                  levels = c('peripheral_nerve', 'Neurofibroma', 'Atypical_NF', 'MPNST'))
+svglite(PTK7boxplotRNA, width = 4, height = 3)
+plotHumanRNA(humanRNAlong, 'PTK7')
+graphics.off()
+kruskal.test(TPM ~ sampleType, data = filter(humanRNAlong, SYMBOL == 'PTK7'))
+# p < 1e-5
+
+## make heatmap of RNA expression for all filtered proteins
+# make matrix of all TPM values, with gene name as rowname
+# convert TPM to log10 to ease visualization
+humanRNAmat <- humanRNA %>%
+  select(matches("^(?!(?:SY|i))", perl = TRUE)) %>%
+  as.matrix() %>% log10()
+# all values that are negative are TPM <=1, set to 0 to not ruin scale
+humanRNAmat[humanRNAmat <= 0] <- 0
+rownames(humanRNAmat) <- humanRNA$SYMBOL
+humanSamples %>% 
+  filter(sampleType %in% c('Neurofibroma', 'Atypical_NF', 'peripheral_nerve', 'MPNST')) %>%
+  mutate(order = case_when(sampleType == 'peripheral_nerve' ~ 1,
+                           sampleType == 'Neurofibroma' ~ 2,
+                           sampleType == 'Atypical_NF' ~ 3,
+                           TRUE ~ 4)) %>%
+  arrange(order) %>%
+  select(newName, sampleType) %>% 
+  column_to_rownames(var = 'newName') -> humanAnnot
+humanRNAmat <- humanRNAmat[,match(rownames(humanAnnot), colnames(humanRNAmat))]
+col_fun <- circlize::colorRamp2(breaks = seq(0, max(humanRNAmat), length.out = 9),
+                                colors = RColorBrewer::brewer.pal(9, 'Greens'))
+annoColors <- scales::hue_pal()(4)
+column_ha <- HeatmapAnnotation(Type = humanAnnot$sampleType,
+                               col = list(Type = c('Neurofibroma' = annoColors[2], 'Atypical_NF' = annoColors[3], 
+                                                   'MPNST' = annoColors[4], 'peripheral_nerve' = annoColors[1])),
+                               annotation_legend_param = list(Type = list(labels = c('ANNUBP', 'MPNST', 'pNF', 'PN'))))
+
+svglite(HumanRNAFltHeatmap, width = 6, height = 8)
+ComplexHeatmap::Heatmap(humanRNAmat, col = col_fun, row_names_gp = gpar(fontsize = 5),
+                        top_annotation = column_ha, cluster_columns = FALSE,
+                        heatmap_legend_param = list(title = expression('log'[10]*' TPM')), 
+                        column_title = NULL, show_column_names = FALSE)
+graphics.off()
+# identify genes whose protein products are in consensus surfaceome within CRISPR dataset
+# essentiality metrics will be lfc against baseline (more negative = more essential)
+# read in LFCs from all run samples (LFC wrt baseline - day 0)
+crisprLFC <- read_tsv('./synLethal_ALLsampleLFC.txt')
+
+svglite(crisprFltListPlot, width = 5, height = 5)
+crisprLFC %>%
+  filter(id %in% totFlt1LIST) %>%
+  ggplot(aes(x = STS26T, y = ST88.14)) + geom_point() +
+  theme_bw() + labs(x = 'STS-26T (LFC from Day 0)', y = 'ST88-14 (LFC from Day 0)') +
+  geom_hline(linetype = 'longdash', yintercept = 0) +
+  geom_vline(linetype = 'longdash', xintercept = 0) +
+  annotate('text', x = c(-0.75, -0.75, 0.5, 0.5), y = c(1.5, -2, 1.5, -2),
+           label = c('16','19','39','23'), fontface = 'bold') +
+  geom_label_repel(data = filter(crisprLFC, id %in% totFlt1LIST & STS26T < 0 & ST88.14 < 0),
+                  inherit.aes = TRUE, aes(label = id), max.overlaps = 30)
+graphics.off()
+
+crisprLFC %>% 
+  filter(id %in% totFlt1LIST) %>% 
+  mutate(group = case_when(ST88.14 < 0 & STS26T < 0 ~ 4, 
+                           ST88.14 < 0 & STS26T > 0 ~ 3, 
+                           ST88.14 > 0 & STS26T < 0 ~ 2, 
+                           TRUE ~ 1)) %>% 
+  group_by(group) %>% 
+  dplyr::summarise(n = n())
+
+
+# run auxiliary functions to get expression from ProteomicsDB
+PDBexp <- lapply(totFlt1uniprot, function(x) getPDBexpression(x))
+names(PDBexp) <- totFlt1LIST
+PDB <- purrr::compact(PDBexp)
+for (i in seq_along(PDB)) {
+  PDB[[i]]$NORMALIZED_INTENSITY <- as.numeric(PDB[[i]]$NORMALIZED_INTENSITY)
+  colnames(PDB[[i]])[2] = names(PDB[i])
+}
+PDB <- purrr::reduce(PDB, dplyr::full_join, by = 'TISSUE_NAME') %>%
+  column_to_rownames(var = 'TISSUE_NAME')
+PDB <- as.matrix(t(PDB))
+# plot
+range <- range(PDB, na.rm = TRUE)
+col_fun <- circlize::colorRamp2(breaks = seq(range[1], range[2], length.out = 9),
+                                colors = RColorBrewer::brewer.pal(9, 'Blues'))
+png('consensusListPDBHeatmap.png', width = 1.5625*1200, height = 1200)
+ComplexHeatmap::Heatmap(PDB, cluster_rows = FALSE, cluster_columns = FALSE,
+                        col = col_fun, row_names_gp = gpar(fontsize = 9),
+                        heatmap_legend_param = list(title = expression('log'[10]*' iBAQ')),
+                        column_title = NULL,
+                        column_names_gp = gpar(fontsize = 12, fontface = 'italic'))
+graphics.off()
+
+
+# plot values in heatmap
 totFlt1mat <- totFlt1 %>% filter(!duplicated(`Gene Symbol`)) %>%
   column_to_rownames(var = 'Gene Symbol') %>% as.matrix()
 
@@ -187,7 +320,7 @@ col_split <- c(rep(1, 7), rep(2, 4))
 column_ha <- HeatmapAnnotation(Model = c(rep('MPNST', 7), rep('PDX', 4)),
                                col = list(Model = c('MPNST' = 'black', 'PDX' = 'grey')))
 
-png(allSampleHeatmapPlot, width = 1.5625*1200, height = 1200)
+svglite(allSampleHeatmapPlot, width = 1.5625*1200, height = 1200)
 ComplexHeatmap::Heatmap(totFlt1mat, cluster_rows = FALSE, cluster_columns = FALSE,
                         col = col_fun, row_names_gp = gpar(fontsize = 9),
                         heatmap_legend_param = list(title = expression('log'[10]*' iBAQ')),
@@ -239,7 +372,7 @@ range <- range(PDXflt2mat, na.rm = TRUE)
 col_fun <- circlize::colorRamp2(breaks = seq(range[1], range[2], length.out = 11),
                                 colors = rev(RColorBrewer::brewer.pal(11, 'RdBu')))
 # plot PDX-specific heatmap
-png(PDXspecFltHeatmapPlot, width = 1.5625*1200, height = 1200)
+svglite(PDXspecFltHeatmapPlot, width = 1.5625*1200, height = 1200)
 ComplexHeatmap::Heatmap(PDXflt2mat, cluster_rows = FALSE, cluster_columns = FALSE,
                         col = col_fun, row_names_gp = gpar(fontsize = 9),
                         heatmap_legend_param = list(title = expression('log'[10]*' LFQ')),
@@ -250,7 +383,7 @@ graphics.off()
 
 # compare RNA and protein data in expression
 # read in TPM, use regex to remove lines starting with N[0-9] (engineered HSCs)
-tpm <- read.table(MPNST.RNA, sep = '\t', row.names = 1) %>%
+tpm <- read.table(MPNSTCL.RNA, sep = '\t', row.names = 1) %>%
   rownames_to_column(var = 'id') %>%
   select(-matches('^N[0-9]+.*'))
 # change keys of RNA data to match protein data
@@ -356,7 +489,7 @@ fcALL <- select(fcProt, `Gene Symbol`, lfc) %>%
   filter(!is.na(lfc) & !is.na(log2FoldChange))
 colnames(fcALL) <- c('gene', 'prot', 'RNA')
 
-
+svglite(RNA.v.protFCPlot, width = 6, height = 4)
 fcPlot <- fcALL %>%
   filter(prot > -6 & prot < 6) %>%
   ggplot(aes(x = RNA, y = prot)) + geom_point() +
@@ -364,14 +497,14 @@ fcPlot <- fcALL %>%
   theme_minimal() + xlab('RNA Fold Change') +
   ylab('Surface Protein Fold Change') +
   geom_text(aes(x = -3, y = 3, label = '\u03c1 = 0.25'))
-ggsave(fcPlot, file = RNA.v.protFCPlot, width = 6, height = 4)
+graphics.off()
 
 # get overlap of MPNST007 and S462TY PRC2 on/off experiments
 fcProtMPNST007 <- read_tsv('./larga002_wangx933_19661_20240722_FAIMS_hcdIT_LFQ_PD30_proteinExport.xlsx - Proteins.tsv') %>%
   mutate(lfc = log2(`Abundance Ratio: (EPZ) / (DMSO)`),
          pval = `Abundance Ratio Adj. P-Value: (EPZ) / (DMSO)`,
-         result = case_when(pval < 0.05 & lfc > 1 ~ 'up',
-                            pval < 0.05 & lfc < -1 ~ 'down',
+         result = case_when(pval < 0.05 & lfc > 0.5 ~ 'up',
+                            pval < 0.05 & lfc < -0.5 ~ 'down',
                             .default = 'NA'),
          name = `Gene Symbol`) %>%
   separate_rows(name, sep = '; ')
@@ -380,8 +513,8 @@ fcProtMPNST007 <- read_tsv('./larga002_wangx933_19661_20240722_FAIMS_hcdIT_LFQ_P
 fcProtS462TY <- read_tsv('./larga002_wangx933_19345_20230929_LFQ_DMSO_DOX- ANOVA_wImputation_Proteins.txt') %>%
   mutate(lfc = -1*log2(`Abundance Ratio DOX  DMSO`),
          pval = `Abundance Ratio Adj P-Value DOX  DMSO`,
-         result = case_when(pval < 0.05 & lfc > 1 ~ 'up',
-                            pval < 0.05 & lfc < -1 ~ 'down',
+         result = case_when(pval < 0.05 & lfc > 0.5 ~ 'up',
+                            pval < 0.05 & lfc < -0.5 ~ 'down',
                             .default = 'NA'),
          name = `Gene Symbol`) %>%
   separate_rows(name, sep = '; ')
@@ -390,6 +523,15 @@ sigUpMPNST007 <- fcProtMPNST007 %>% filter(pval < 0.05 & lfc > 0)
 sigUpS462TY <- fcProtS462TY %>% filter(pval < 0.05 & lfc > 0 & Contaminant == 'FALSE')
 sigUpNamesMPNST007 <- na.omit(sigUpMPNST007$`Gene Symbol`[!duplicated(sigUpMPNST007$`Gene Symbol`)])
 sigUpNamesS462TY <- na.omit(sigUpS462TY$`Gene Symbol`[!duplicated(sigUpS462TY$`Gene Symbol`)])
+
+# pathway-level analysis (using hallmark pathways)
+HallmarkPath <- read.gmt(hallmarkGMT)
+sigPathS462TY <- clusterProfiler::enricher(sigUpNamesS462TY, TERM2GENE = HallmarkPath, pvalueCutoff = 1)
+sigPathMPNST007 <- clusterProfiler::enricher(sigUpNamesMPNST007, TERM2GENE = HallmarkPath, pvalueCutoff = 1)
+sigPathS462TY@result$p.adjust <- sigPathS462TY@result$pvalue
+
+dotplot(sigPathS462TY)
+dotplot(sigPathMPNST007)
 
 # plot MPNST007
 # red means higher expression when PRC2 is active, blue is when PRC2 is inactive
